@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Symlink the pier script onto your PATH. Run `pier setup` afterwards.
+# Copy the pier script onto your PATH. Run `pier setup` afterwards.
 set -euo pipefail
 
 SOURCE="$(cd "$(dirname "$0")" && pwd)/pier"
@@ -12,12 +12,12 @@ if [ ! -d "$(dirname "$TARGET")" ]; then
 fi
 
 if [ -w "$(dirname "$TARGET")" ]; then
-  ln -sf "$SOURCE" "$TARGET"
+  install -m 0755 "$SOURCE" "$TARGET"
 else
-  sudo ln -sf "$SOURCE" "$TARGET"
+  sudo install -m 0755 "$SOURCE" "$TARGET"
 fi
 
-echo "installed: $TARGET → $SOURCE"
+echo "installed: $TARGET"
 
 TARGET_DIR="$(dirname "$TARGET")"
 case ":$PATH:" in
