@@ -62,7 +62,7 @@ Requirements: macOS, [Homebrew](https://brew.sh).
 ```bash
 git clone <this repo> pier
 cd pier
-./install.sh        # symlinks /usr/local/bin/pier → ./pier
+./install.sh        # copies pier to /usr/local/bin/pier
 pier setup          # one-time onboarding: dnsmasq, /etc/resolver, pf, launchd
                     # prompts for sudo once
 ```
