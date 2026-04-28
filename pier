@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""pier — a port broker for *.test on macOS.
+
+Allocates ports in 19000-19999 to named slots and (optionally) routes
+http://<name>.test/ to 127.0.0.1:<port>. Auto-releases idle slots after
+1h with no listener.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import plistlib
+import shutil
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+# --------------------------------------------------------------------- config
+PIER_DIR     = Path.home() / ".pier"
+STATE_FILE   = PIER_DIR / "state.json"
+LOCK_FILE    = PIER_DIR / "state.lock"
+LOG_FILE     = PIER_DIR / "pier.log"
+SETUP_MARKER = PIER_DIR / "setup.json"
+
+PROXY_PORT     = 7878
+PORT_RANGE     = range(19000, 20000)
+GRACE_SECONDS  = 3600     # 1h with no listener → release
+GC_INTERVAL    = 60
+PROBE_TIMEOUT  = 0.5
+
+DAEMON_LABEL   = "dev.pier.daemon"
+PF_ANCHOR      = "/etc/pf.anchors/dev.pier"
+RESOLVER_FILE  = "/etc/resolver/test"
+
+# --------------------------------------------------------------------- state
+def _ensure_dir():
+    PIER_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_state():
+    if not STATE_FILE.exists():
+        return {"allocations": {}}
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"allocations": {}}
+    data.setdefault("allocations", {})
+    return data
+
+
+def _save_state(state):
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_FILE)
+
+
+def with_lock(fn):
+    """Run fn(state) under an exclusive file lock; persist mutations."""
+    _ensure_dir()
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = _load_state()
+            result = fn(state)
+            _save_state(state)
+            return result
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------- allocation
+def allocate(name, no_url):
+    def op(state):
+        allocs = state["allocations"]
+        if name in allocs:
+            return allocs[name]
+        used = {a["port"] for a in allocs.values()}
+        for port in PORT_RANGE:
+            if port not in used:
+                now = int(time.time())
+                allocs[name] = {
+                    "name": name,
+                    "port": port,
+                    "url": not no_url,
+                    "created_at": now,
+                    "last_alive_at": now,
+                }
+                return allocs[name]
+        raise RuntimeError(f"no free ports in {PORT_RANGE.start}-{PORT_RANGE.stop - 1}")
+    return with_lock(op)
+
+
+def release(name):
+    return with_lock(lambda s: s["allocations"].pop(name, None))
+
+
+def get_alloc(name):
+    return _load_state()["allocations"].get(name)
+
+
+def list_allocs():
+    return _load_state()["allocations"]
+
+
+# ----------------------------------------------------------------- helpers
+def valid_name(name):
+    if not name or not all(c.isalnum() or c in "-_" for c in name):
+        die("name must be alphanumeric, dashes, or underscores")
+    if len(name) > 63:
+        die("name must be 63 characters or fewer")
+
+
+def human_duration(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:    return f"{seconds}s"
+    if seconds < 3600:  return f"{seconds // 60}m"
+    if seconds < 86400: return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def setup_warn_if_needed():
+    if SETUP_MARKER.exists():
+        return
+    sys.stderr.write(
+        "warning: pier setup hasn't been run — .test routing will not work\n"
+        "         run: pier setup\n"
+    )
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"pier: {msg}\n")
+    sys.exit(code)
+
+
+def log(msg):
+    sys.stdout.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    sys.stdout.flush()
+
+
+# ------------------------------------------------------------------- CLI ops
+def cmd_new(args):
+    valid_name(args.name)
+    setup_warn_if_needed()
+    a = allocate(args.name, args.no_url)
+    if args.json:
+        print(json.dumps(a))
+    else:
+        print(a["port"])
+        if a["url"]:
+            sys.stderr.write(f"http://{args.name}.test → 127.0.0.1:{a['port']}\n")
+
+
+def cmd_get(args):
+    a = get_alloc(args.name)
+    if a is None:
+        die(f"no allocation named {args.name!r}")
+    if args.json:
+        print(json.dumps(a))
+    else:
+        print(a["port"])
+
+
+def cmd_list(args):
+    allocs = list_allocs()
+    if args.json:
+        print(json.dumps(allocs, indent=2))
+        return
+    if not allocs:
+        print("(no allocations)")
+        return
+    now = int(time.time())
+    fmt = "{:<24} {:>5}  {:<32}  {:<10} {:<10}"
+    print(fmt.format("NAME", "PORT", "URL", "ALIVE", "AGE"))
+    for name, a in sorted(allocs.items(), key=lambda kv: kv[1]["port"]):
+        url = f"http://{name}.test" if a["url"] else "—"
+        alive = human_duration(now - a["last_alive_at"]) + " ago"
+        age   = human_duration(now - a["created_at"])
+        print(fmt.format(name, a["port"], url, alive, age))
+
+
+def cmd_release(args):
+    a = release(args.name)
+    if a is None:
+        die(f"no allocation named {args.name!r}")
+    print(f"released {args.name} (port {a['port']})")
+
+
+# --------------------------------------------------------------------- proxy
+def parse_host(buf):
+    try:
+        head = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+    except Exception:
+        return None
+    for line in head.split("\r\n")[1:]:
+        if ":" in line and line.split(":", 1)[0].lower() == "host":
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def http_error(code, msg):
+    body = f"{code} {msg}\n".encode()
+    headers = (
+        f"HTTP/1.1 {code} {msg}\r\n"
+        f"Content-Type: text/plain\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode()
+    return headers + body
+
+
+def pipe(src, dst):
+    try:
+        while True:
+            data = src.recv(8192)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def _touch_alive(state, name):
+    a = state["allocations"].get(name)
+    if a:
+        a["last_alive_at"] = int(time.time())
+
+
+class ProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client = self.request
+        client.settimeout(10)
+        try:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+                if len(buf) > 64 * 1024:
+                    client.sendall(http_error(431, "Request headers too large"))
+                    return
+
+            host = parse_host(buf)
+            if not host:
+                client.sendall(http_error(400, "Missing Host header"))
+                return
+
+            name = host.split(":", 1)[0]
+            if name.endswith(".test"):
+                name = name[:-5]
+
+            alloc = get_alloc(name)
+            if alloc is None or not alloc.get("url"):
+                client.sendall(http_error(404, f"No pier route for {host}"))
+                return
+
+            try:
+                upstream = socket.create_connection(("127.0.0.1", alloc["port"]), timeout=5)
+            except OSError:
+                client.sendall(http_error(
+                    502, f"Upstream not listening on 127.0.0.1:{alloc['port']}"))
+                return
+
+            try:
+                with_lock(lambda s: _touch_alive(s, name))
+            except Exception:
+                pass
+
+            client.settimeout(None)
+            upstream.settimeout(None)
+            try:
+                upstream.sendall(buf)
+            except OSError:
+                upstream.close()
+                return
+
+            t = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
+            t.start()
+            pipe(upstream, client)
+            t.join(timeout=5)
+            try:
+                upstream.close()
+            except OSError:
+                pass
+        except Exception as e:
+            log(f"proxy error: {e}")
+
+
+class ProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+# ----------------------------------------------------------------- gc loop
+def probe(port):
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=PROBE_TIMEOUT)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def gc_once():
+    now = int(time.time())
+
+    snapshot = list(_load_state()["allocations"].values())
+    alive_now = {a["name"]: probe(a["port"]) for a in snapshot}
+
+    def op(state):
+        released = []
+        for name, a in list(state["allocations"].items()):
+            if alive_now.get(name):
+                a["last_alive_at"] = now
+            elif (now - a["last_alive_at"] > GRACE_SECONDS
+                  and now - a["created_at"]    > GRACE_SECONDS):
+                released.append(state["allocations"].pop(name))
+        return released
+
+    released = with_lock(op)
+    for a in released:
+        log(f"gc released {a['name']} (port {a['port']}) — idle > {GRACE_SECONDS}s")
+
+
+def gc_loop():
+    while True:
+        try:
+            gc_once()
+        except Exception as e:
+            log(f"gc error: {e}")
+        time.sleep(GC_INTERVAL)
+
+
+def cmd_daemon(args):
+    log(f"pier daemon starting (proxy 127.0.0.1:{PROXY_PORT})")
+    threading.Thread(target=gc_loop, daemon=True).start()
+    server = ProxyServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("pier daemon stopping")
+        server.shutdown()
+
+
+# ------------------------------------------------------------------ setup
+ASCII_ART = r"""
+                              ⚓
+                              |
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                              |
+        ___  _ ___ _ _        |       ╱|、
+       | _ \(_) __| '_)       |      (˚ˎ 。7      ports docking
+       |  _/| | _|| |         |       |、˜〵      19000-19999
+       |_|  |_|___|_|         |       じしˍ,)ノ
+                              |
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""
+
+SETUP_STEPS = 5
+
+
+def step(n, msg):
+    print(f"\n[{n}/{SETUP_STEPS}] {msg}")
+
+
+def run(cmd, **kw):
+    print(f"      $ {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, **kw)
+
+
+def cmd_setup(args):
+    print(ASCII_ART)
+    print("  Welcome to pier — port broker + .test routing for your dev machine.\n")
+
+    pier_bin = os.path.realpath(sys.argv[0])
+    print(f"  pier binary: {pier_bin}")
+    _ensure_dir()
+
+    # 1. dnsmasq + .test resolution
+    step(1, "Installing dnsmasq via Homebrew…")
+    if shutil.which("brew") is None:
+        die("Homebrew is required (https://brew.sh)")
+    if subprocess.run(["brew", "list", "dnsmasq"],
+                      capture_output=True).returncode != 0:
+        run(["brew", "install", "dnsmasq"])
+    else:
+        print("      dnsmasq already installed.")
+
+    brew_prefix = subprocess.check_output(["brew", "--prefix"]).decode().strip()
+    conf_dir = Path(brew_prefix) / "etc" / "dnsmasq.d"
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    (conf_dir / "dev.pier.conf").write_text("address=/.test/127.0.0.1\n")
+
+    base_conf = Path(brew_prefix) / "etc" / "dnsmasq.conf"
+    conf_dir_line = f"conf-dir={conf_dir}/,*.conf"
+    if base_conf.exists():
+        existing = base_conf.read_text()
+        if conf_dir_line not in existing:
+            base_conf.write_text(existing.rstrip() + "\n\n" + conf_dir_line + "\n")
+    print(f"      wrote {conf_dir / 'dev.pier.conf'}")
+
+    # 2. system resolver, pf redirect, dnsmasq service (all need sudo)
+    step(2, "Configuring system resolver, pf redirect, and dnsmasq service…")
+    print("      (sudo required)")
+    sudo_script = f"""
+set -e
+mkdir -p /etc/resolver
+echo 'nameserver 127.0.0.1' > {RESOLVER_FILE}
+chmod 644 {RESOLVER_FILE}
+
+cat > {PF_ANCHOR} <<'ANCHOR'
+rdr pass on lo0 inet proto tcp from any to any port 80 -> 127.0.0.1 port {PROXY_PORT}
+ANCHOR
+chmod 644 {PF_ANCHOR}
+
+if ! grep -q 'dev\\.pier' /etc/pf.conf; then
+  printf '\\nrdr-anchor "dev.pier"\\nload anchor "dev.pier" from "{PF_ANCHOR}"\\n' >> /etc/pf.conf
+fi
+
+pfctl -f /etc/pf.conf >/dev/null 2>&1 || true
+pfctl -E >/dev/null 2>&1 || true
+
+brew services restart dnsmasq
+"""
+    run(["sudo", "bash", "-c", sudo_script])
+
+    # 3. LaunchAgent for the daemon
+    step(3, "Installing launch agent for the pier daemon…")
+    plist_path = install_launch_agent(pier_bin)
+    print(f"      wrote {plist_path}")
+
+    # 4. Mark setup complete
+    step(4, "Marking setup complete…")
+    SETUP_MARKER.write_text(json.dumps({"completed_at": int(time.time())}, indent=2))
+    print(f"      wrote {SETUP_MARKER}")
+
+    # 5. Sanity check
+    step(5, "Verifying daemon is up…")
+    deadline = time.time() + 5
+    ok = False
+    while time.time() < deadline:
+        if probe(PROXY_PORT):
+            ok = True
+            break
+        time.sleep(0.25)
+    print("      daemon is listening." if ok else
+          "      daemon hasn't bound :7878 yet — check ~/.pier/pier.log")
+
+    print("""
+  All set. Try it out:
+
+      $ pier new roadcase-vixen
+      19000
+      # start your app on port 19000, then visit:
+      #   http://roadcase-vixen.test/
+
+      $ pier new mydb --no-url
+      19001
+      # use 127.0.0.1:19001 from your code; no http route created.
+
+      $ pier list
+      $ pier release roadcase-vixen
+""")
+
+
+def install_launch_agent(pier_bin):
+    plist = {
+        "Label": DAEMON_LABEL,
+        "ProgramArguments": [pier_bin, "daemon"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(LOG_FILE),
+        "StandardErrorPath": str(LOG_FILE),
+    }
+    plist_path = Path.home() / "Library/LaunchAgents" / f"{DAEMON_LABEL}.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(plist_path, "wb") as f:
+        plistlib.dump(plist, f)
+    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
+    run(["launchctl", "load", str(plist_path)])
+    return plist_path
+
+
+# ------------------------------------------------------------------- main
+def main():
+    p = argparse.ArgumentParser(prog="pier", description="port broker for *.test")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("new", help="allocate a port for <name> (idempotent)")
+    s.add_argument("name")
+    s.add_argument("--no-url", action="store_true",
+                   help="do not register an http://<name>.test route")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_new)
+
+    s = sub.add_parser("get", help="print the port for <name>")
+    s.add_argument("name")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_get)
+
+    s = sub.add_parser("list", help="show all allocations")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("release", help="free <name>'s port immediately")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_release)
+
+    s = sub.add_parser("setup", help="one-time onboarding: dnsmasq + pf + launchd")
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("daemon", help="run the proxy + GC loop (used by launchd)")
+    s.set_defaults(func=cmd_daemon)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
