@@ -18,5 +18,20 @@ else
 fi
 
 echo "installed: $TARGET → $SOURCE"
+
+TARGET_DIR="$(dirname "$TARGET")"
+case ":$PATH:" in
+  *":$TARGET_DIR:"*) ;;
+  *)
+    ZSHRC="${ZDOTDIR:-$HOME}/.zshrc"
+    LINE="export PATH=\"$TARGET_DIR:\$PATH\""
+    if [ ! -f "$ZSHRC" ] || ! grep -Fqx "$LINE" "$ZSHRC"; then
+      printf '\n# added by pier install\n%s\n' "$LINE" >> "$ZSHRC"
+      echo "added $TARGET_DIR to PATH in $ZSHRC"
+      echo "      run 'source $ZSHRC' or open a new shell to pick it up"
+    fi
+    ;;
+esac
+
 echo
 echo "next:  pier setup"
