@@ -27,14 +27,16 @@ LOCK_FILE    = PIER_DIR / "state.lock"
 LOG_FILE     = PIER_DIR / "pier.log"
 SETUP_MARKER = PIER_DIR / "setup.json"
 
-PROXY_PORT     = 7878
+PROXY_PORT     = 80
 PORT_RANGE     = range(19000, 20000)
 GRACE_SECONDS  = 3600     # 1h with no listener → release
 GC_INTERVAL    = 60
 PROBE_TIMEOUT  = 0.5
 
 DAEMON_LABEL   = "dev.pier.daemon"
-PF_ANCHOR      = "/etc/pf.anchors/dev.pier"
+DAEMON_PLIST   = f"/Library/LaunchDaemons/{DAEMON_LABEL}.plist"
+LEGACY_AGENT   = Path.home() / "Library/LaunchAgents" / f"{DAEMON_LABEL}.plist"
+LEGACY_PF_ANCHOR = "/etc/pf.anchors/dev.pier"
 RESOLVER_FILE  = "/etc/resolver/test"
 
 # --------------------------------------------------------------------- state
@@ -60,17 +62,28 @@ def _save_state(state):
 
 
 def with_lock(fn):
-    """Run fn(state) under an exclusive file lock; persist mutations."""
+    """Run fn(state) under an exclusive file lock; persist mutations.
+
+    Lock + state files are kept world-writable so the root-owned daemon and
+    the user-owned CLI can both update them.
+    """
     _ensure_dir()
-    with open(LOCK_FILE, "w") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    fd = os.open(str(LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        try:
+            os.fchmod(fd, 0o666)
+        except PermissionError:
+            pass
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             state = _load_state()
             result = fn(state)
             _save_state(state)
             return result
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------- allocation
@@ -366,7 +379,7 @@ ASCII_ART = r"""
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~|~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 """
 
-SETUP_STEPS = 5
+SETUP_STEPS = 4
 
 
 def step(n, msg):
@@ -385,6 +398,31 @@ def cmd_setup(args):
     pier_bin = os.path.realpath(sys.argv[0])
     print(f"  pier binary: {pier_bin}")
     _ensure_dir()
+
+    invoking_user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+    if not invoking_user or invoking_user == "root":
+        die("run pier setup as your normal user (not via sudo)")
+
+    # Pre-create the lock file world-writable so the root daemon and the
+    # user CLI can both flock it later.
+    try:
+        fd = os.open(str(LOCK_FILE), os.O_WRONLY | os.O_CREAT, 0o666)
+        try:
+            os.fchmod(fd, 0o666)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        die(f"could not create {LOCK_FILE}: {e}")
+
+    # If a pre-1.x user-mode LaunchAgent is around, tear it down.
+    if LEGACY_AGENT.exists():
+        subprocess.run(["launchctl", "unload", str(LEGACY_AGENT)],
+                       capture_output=True)
+        try:
+            LEGACY_AGENT.unlink()
+        except OSError:
+            pass
+        print(f"      removed legacy LaunchAgent {LEGACY_AGENT}")
 
     # 1. dnsmasq + .test resolution
     step(1, "Installing dnsmasq via Homebrew…")
@@ -409,43 +447,50 @@ def cmd_setup(args):
             base_conf.write_text(existing.rstrip() + "\n\n" + conf_dir_line + "\n")
     print(f"      wrote {conf_dir / 'dev.pier.conf'}")
 
-    # 2. system resolver, pf redirect, dnsmasq service (all need sudo)
-    step(2, "Configuring system resolver, pf redirect, and dnsmasq service…")
+    # 2. resolver, dnsmasq service, LaunchDaemon, pf cleanup (all sudo)
+    step(2, "Configuring system resolver, launch daemon, dnsmasq…")
     print("      (sudo required)")
+
+    plist_xml = build_daemon_plist(pier_bin, invoking_user).decode("utf-8")
+
     sudo_script = f"""
 set -e
 mkdir -p /etc/resolver
 echo 'nameserver 127.0.0.1' > {RESOLVER_FILE}
 chmod 644 {RESOLVER_FILE}
 
-cat > {PF_ANCHOR} <<'ANCHOR'
-rdr pass on lo0 inet proto tcp from any to any port 80 -> 127.0.0.1 port {PROXY_PORT}
-ANCHOR
-chmod 644 {PF_ANCHOR}
-
-if ! grep -q 'dev\\.pier' /etc/pf.conf; then
-  printf '\\nrdr-anchor "dev.pier"\\nload anchor "dev.pier" from "{PF_ANCHOR}"\\n' >> /etc/pf.conf
+# Drop any pre-1.x pf redirect — pier now binds :80 directly.
+rm -f {LEGACY_PF_ANCHOR}
+if grep -q 'dev\\.pier' /etc/pf.conf 2>/dev/null; then
+  /usr/bin/sed -i '' '/dev\\.pier/d' /etc/pf.conf
+  pfctl -f /etc/pf.conf >/dev/null 2>&1 || true
 fi
 
-pfctl -f /etc/pf.conf >/dev/null 2>&1 || true
-pfctl -E >/dev/null 2>&1 || true
+mkdir -p /Library/LaunchDaemons
+cat > {DAEMON_PLIST} <<'PLIST'
+{plist_xml}
+PLIST
+chown root:wheel {DAEMON_PLIST}
+chmod 644 {DAEMON_PLIST}
+
+# Reload daemon (bootout may not exist on older launchd; ignore failure).
+launchctl bootout system/{DAEMON_LABEL} >/dev/null 2>&1 || \
+  launchctl unload {DAEMON_PLIST} >/dev/null 2>&1 || true
+launchctl bootstrap system {DAEMON_PLIST} >/dev/null 2>&1 || \
+  launchctl load {DAEMON_PLIST}
 
 brew services restart dnsmasq
 """
     run(["sudo", "bash", "-c", sudo_script])
+    print(f"      wrote {DAEMON_PLIST}")
 
-    # 3. LaunchAgent for the daemon
-    step(3, "Installing launch agent for the pier daemon…")
-    plist_path = install_launch_agent(pier_bin)
-    print(f"      wrote {plist_path}")
-
-    # 4. Mark setup complete
-    step(4, "Marking setup complete…")
+    # 3. Mark setup complete
+    step(3, "Marking setup complete…")
     SETUP_MARKER.write_text(json.dumps({"completed_at": int(time.time())}, indent=2))
     print(f"      wrote {SETUP_MARKER}")
 
-    # 5. Sanity check
-    step(5, "Verifying daemon is up…")
+    # 4. Sanity check
+    step(4, "Verifying daemon is up…")
     deadline = time.time() + 5
     ok = False
     while time.time() < deadline:
@@ -453,8 +498,8 @@ brew services restart dnsmasq
             ok = True
             break
         time.sleep(0.25)
-    print("      daemon is listening." if ok else
-          "      daemon hasn't bound :7878 yet — check ~/.pier/pier.log")
+    print("      daemon is listening on :80." if ok else
+          "      daemon hasn't bound :80 yet — check ~/.pier/pier.log")
 
     print("""
   All set. Try it out:
@@ -473,7 +518,7 @@ brew services restart dnsmasq
 """)
 
 
-def install_launch_agent(pier_bin):
+def build_daemon_plist(pier_bin, user):
     plist = {
         "Label": DAEMON_LABEL,
         "ProgramArguments": [pier_bin, "daemon"],
@@ -481,14 +526,13 @@ def install_launch_agent(pier_bin):
         "KeepAlive": True,
         "StandardOutPath": str(LOG_FILE),
         "StandardErrorPath": str(LOG_FILE),
+        # Daemon binds :80, so it runs as root via launchd. Set HOME so
+        # Path.home() resolves to the invoking user's ~/.pier state dir.
+        "EnvironmentVariables": {
+            "HOME": str(Path("/Users") / user),
+        },
     }
-    plist_path = Path.home() / "Library/LaunchAgents" / f"{DAEMON_LABEL}.plist"
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(plist_path, "wb") as f:
-        plistlib.dump(plist, f)
-    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
-    run(["launchctl", "load", str(plist_path)])
-    return plist_path
+    return plistlib.dumps(plist)
 
 
 # ------------------------------------------------------------------- main
